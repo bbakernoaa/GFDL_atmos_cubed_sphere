@@ -772,6 +772,7 @@ module fv_arrays_mod
                                    !< each with its own computed sub-cycling time step (if q_split = 0).
                                    !< This may improve efficiency for very large numbers of tracers.
                                    !< The default value is .false.; currently not implemented.
+   logical :: use_ff_cslam = .false.   !< Optional logical to explicitly control use of FF-CSLAM, overrides transport_scheme if set
 
    logical :: old_divg_damp = .false. !< parameter to revert damping parameters back to values
                                       !< defined in a previous revision

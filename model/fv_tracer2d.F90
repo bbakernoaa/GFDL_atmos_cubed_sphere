@@ -63,6 +63,7 @@
 
 module fv_tracer2d_mod
    use tp_core_mod,       only: fv_tp_2d, copy_corners
+   use ff_cslam_core_mod, only: ff_cslam_tr_2d, ff_cslam_tr_multi
    use fv_mp_mod,         only: mp_reduce_max
    use fv_mp_mod,         only: mp_gather, is_master
    use fv_mp_mod,         only: group_halo_update_type
@@ -75,774 +76,879 @@ module fv_tracer2d_mod
    use fv_arrays_mod,     only: fv_grid_type, fv_nest_type, fv_atmos_type, fv_grid_bounds_type
    use mpp_mod,           only: mpp_error, FATAL, mpp_broadcast, mpp_send, mpp_recv, mpp_sum, mpp_max
 
-implicit none
-private
+ implicit none
+ private
 
-public :: tracer_2d, tracer_2d_nested, tracer_2d_1L
+ public :: tracer_2d, tracer_2d_nested, tracer_2d_1L
 
-real, allocatable, dimension(:,:,:) :: nest_fx_west_accum, nest_fx_east_accum, nest_fx_south_accum, nest_fx_north_accum
+ real, allocatable, dimension(:,:,:) :: nest_fx_west_accum, nest_fx_east_accum, nest_fx_south_accum, nest_fx_north_accum
 
 contains
 
-!>@brief The subroutine 'tracer_2d_1L' performs 2-D horizontal-to-lagrangian transport.
-!>@details This subroutine is called if 'z_tracer = .true.'
-!! It modifies 'tracer_2d' so that each layer uses a different diagnosed number
-!! of split tracer timesteps. This potentially accelerates tracer advection when there
-!! is a large difference in layer-maximum wind speeds (cf. polar night jet).
-subroutine tracer_2d_1L(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
-                        nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, lim_fac)
+ !>@brief The subroutine 'tracer_2d_1L' performs 2-D horizontal-to-lagrangian transport.
+ !>@details This subroutine is called if 'z_tracer = .true.'
+ !! It modifies 'tracer_2d' so that each layer uses a different diagnosed number
+ !! of split tracer timesteps. This potentially accelerates tracer advection when there
+ !! is a large difference in layer-maximum wind speeds (cf. polar night jet).
+ subroutine tracer_2d_1L(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
+                          nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, lim_fac, &
+                          transport_scheme)
+   character(len=*), intent(in) :: transport_scheme
 
-      type(fv_grid_bounds_type), intent(IN) :: bd
-      integer, intent(IN) :: npx
-      integer, intent(IN) :: npy
-      integer, intent(IN) :: npz
-      integer, intent(IN) :: nq    !< number of tracers to be advected
-      integer, intent(IN) :: hord, nord_tr
-      integer, intent(IN) :: q_split
-      integer, intent(IN) :: id_divg
-      real   , intent(IN) :: dt, trdm
-      real   , intent(IN) :: lim_fac
-      type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
-      real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
-      real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
-      real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
-      real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
-      real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
-      real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
-      type(fv_grid_type), intent(IN), target :: gridstruct
-      type(domain2d), intent(INOUT) :: domain
+       type(fv_grid_bounds_type), intent(IN) :: bd
+       integer, intent(IN) :: npx
+       integer, intent(IN) :: npy
+       integer, intent(IN) :: npz
+       integer, intent(IN) :: nq    !< number of tracers to be advected
+       integer, intent(IN) :: hord, nord_tr
+       integer, intent(IN) :: q_split
+       integer, intent(IN) :: id_divg
+       real   , intent(IN) :: dt, trdm
+       real   , intent(IN) :: lim_fac
+       type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
+       real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
+       real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
+       real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
+       real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
+       real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
+       real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
+       type(fv_grid_type), intent(IN), target :: gridstruct
+       type(domain2d), intent(INOUT) :: domain
 
-! Local Arrays
-      real :: qn2(bd%isd:bd%ied,bd%jsd:bd%jed,nq)   !< 3D tracers
-      real :: dp2(bd%is:bd%ie,bd%js:bd%je)
-      real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
-      real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
-      real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
-      real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
-      real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
-      real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
-      real :: cmax(npz)
-      real :: frac
-      integer :: nsplt
-      integer :: i,j,k,it,iq
+ ! Local Arrays
+       real :: qn2(bd%isd:bd%ied,bd%jsd:bd%jed,nq)   !< 3D tracers
+       real :: dp2(bd%is:bd%ie,bd%js:bd%je)
+       real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
+       real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
+       real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
+       real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
+       real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
+       real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
+       real :: cmax(npz)
+       real :: frac
+       integer :: nsplt
+       integer :: i,j,k,it,iq
+       real :: u(bd%is:bd%ie+1,bd%jsd:bd%jed)
+       real :: v(bd%isd:bd%ied,bd%js:bd%je+1)
+       real :: q_slice(bd%isd:bd%ied,bd%jsd:bd%jed,nq)  ! OPTIMIZATION: Local slice for multi-tracer CSLAM
 
-      real, pointer, dimension(:,:) :: area, rarea
-      real, pointer, dimension(:,:,:) :: sin_sg
-      real, pointer, dimension(:,:) :: dxa, dya, dx, dy
+       real, pointer, dimension(:,:) :: area, rarea
+       real, pointer, dimension(:,:,:) :: sin_sg
+       real, pointer, dimension(:,:) :: dxa, dya, dx, dy
 
-      integer :: is,  ie,  js,  je
-      integer :: isd, ied, jsd, jed
+       integer :: is,  ie,  js,  je
+       integer :: isd, ied, jsd, jed
 
-      is  = bd%is
-      ie  = bd%ie
-      js  = bd%js
-      je  = bd%je
-      isd = bd%isd
-      ied = bd%ied
-      jsd = bd%jsd
-      jed = bd%jed
+       is  = bd%is
+       ie  = bd%ie
+       js  = bd%js
+       je  = bd%je
+       isd = bd%isd
+       ied = bd%ied
+       jsd = bd%jsd
+       jed = bd%jed
 
-       area => gridstruct%area
-      rarea => gridstruct%rarea
+        area => gridstruct%area
+       rarea => gridstruct%rarea
 
-      sin_sg => gridstruct%sin_sg
-      dxa    => gridstruct%dxa
-      dya    => gridstruct%dya
-      dx     => gridstruct%dx
-      dy     => gridstruct%dy
+       sin_sg => gridstruct%sin_sg
+       dxa    => gridstruct%dxa
+       dya    => gridstruct%dya
+       dx     => gridstruct%dx
+       dy     => gridstruct%dy
 
 !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,dxa,dy, &
 !$OMP                                  sin_sg,cy,yfx,dya,dx,cmax)
-  do k=1,npz
-     do j=jsd,jed
-        do i=is,ie+1
-           if (cx(i,j,k) > 0.) then
-              xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
-           else
-              xfx(i,j,k) = cx(i,j,k)*dxa(i,  j)*dy(i,j)*sin_sg(i,  j,1)
-           endif
-        enddo
-     enddo
-     do j=js,je+1
-        do i=isd,ied
-           if (cy(i,j,k) > 0.) then
-              yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
-           else
-              yfx(i,j,k) = cy(i,j,k)*dya(i,j  )*dx(i,j)*sin_sg(i,j,  2)
-           endif
-        enddo
-     enddo
+   do k=1,npz
+      do j=jsd,jed
+         do i=is,ie+1
+            if (cx(i,j,k) > 0.) then
+               xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
+            else
+               xfx(i,j,k) = cx(i,j,k)*dxa(i,  j)*dy(i,j)*sin_sg(i,  j,1)
+            endif
+         enddo
+      enddo
+      do j=js,je+1
+         do i=isd,ied
+            if (cy(i,j,k) > 0.) then
+               yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
+            else
+               yfx(i,j,k) = cy(i,j,k)*dya(i,j  )*dx(i,j)*sin_sg(i,j,  2)
+            endif
+         enddo
+      enddo
 
-     cmax(k) = 0.
-     if ( k < npz/6 ) then
-          do j=js,je
-             do i=is,ie
-                cmax(k) = max( cmax(k), abs(cx(i,j,k)), abs(cy(i,j,k)) )
-             enddo
-          enddo
-     else
-          do j=js,je
-             do i=is,ie
-                cmax(k) = max( cmax(k), max(abs(cx(i,j,k)),abs(cy(i,j,k)))+1.-sin_sg(i,j,5) )
-             enddo
-          enddo
+      cmax(k) = 0.
+      if ( k < npz/6 ) then
+           do j=js,je
+              do i=is,ie
+                 cmax(k) = max( cmax(k), abs(cx(i,j,k)), abs(cy(i,j,k)) )
+              enddo
+           enddo
+      else
+           do j=js,je
+              do i=is,ie
+                 cmax(k) = max( cmax(k), max(abs(cx(i,j,k)),abs(cy(i,j,k)))+1.-sin_sg(i,j,5) )
+              enddo
+           enddo
+      endif
+   enddo  ! k-loop
+
+     if (trdm>1.e-4) then
+                         call timing_on('COMM_TOTAL')
+                             call timing_on('COMM_TRACER')
+       call complete_group_halo_update(dp1_pack, domain)
+                            call timing_off('COMM_TRACER')
+                        call timing_off('COMM_TOTAL')
+
      endif
-  enddo  ! k-loop
-
-    if (trdm>1.e-4) then
-                        call timing_on('COMM_TOTAL')
-                            call timing_on('COMM_TRACER')
-      call complete_group_halo_update(dp1_pack, domain)
-                           call timing_off('COMM_TRACER')
-                       call timing_off('COMM_TOTAL')
-
-    endif
-  call mp_reduce_max(cmax,npz)
+   call mp_reduce_max(cmax,npz)
 
 !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx, &
 !$OMP                                  cy,yfx,mfx,mfy,cmax)   &
 !$OMP                          private(nsplt, frac)
-  do k=1,npz
+   do k=1,npz
 
-     nsplt = int(1. + cmax(k))
-     if ( nsplt > 1 ) then
-        frac  = 1. / real(nsplt)
-        do j=jsd,jed
-           do i=is,ie+1
-               cx(i,j,k) =  cx(i,j,k) * frac
-              xfx(i,j,k) = xfx(i,j,k) * frac
-           enddo
-        enddo
-        do j=js,je
-           do i=is,ie+1
-              mfx(i,j,k) = mfx(i,j,k) * frac
-           enddo
-        enddo
-        do j=js,je+1
-           do i=isd,ied
-              cy(i,j,k) =  cy(i,j,k) * frac
-             yfx(i,j,k) = yfx(i,j,k) * frac
-           enddo
-        enddo
-        do j=js,je+1
-           do i=is,ie
-              mfy(i,j,k) = mfy(i,j,k) * frac
-           enddo
-        enddo
-     endif
-
-  enddo
-                               call timing_on('COMM_TOTAL')
-                         call timing_on('COMM_TRACER')
-  call complete_group_halo_update(q_pack, domain)
-                        call timing_off('COMM_TRACER')
-                              call timing_off('COMM_TOTAL')
-
-! Begin k-independent tracer transport; can not be OpenMPed because the mpp_update call.
-  do k=1,npz
-
-!$OMP parallel do default(none) shared(k,is,ie,js,je,isd,ied,jsd,jed,xfx,area,yfx,ra_x,ra_y)
-     do j=jsd,jed
-        do i=is,ie
-           ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
-        enddo
-        if ( j>=js .and. j<=je ) then
-           do i=isd,ied
-              ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
-           enddo
-        endif
-     enddo
-
-     nsplt = int(1. + cmax(k))
-     do it=1,nsplt
-
-!$OMP parallel do default(none) shared(k,is,ie,js,je,rarea,mfx,mfy,dp1,dp2)
-        do j=js,je
-           do i=is,ie
-              dp2(i,j) = dp1(i,j,k) + (mfx(i,j,k)-mfx(i+1,j,k)+mfy(i,j,k)-mfy(i,j+1,k))*rarea(i,j)
-           enddo
-        enddo
-
-!$OMP parallel do default(none) shared(k,nsplt,it,is,ie,js,je,isd,ied,jsd,jed,npx,npy,cx,xfx,hord,trdm, &
-!$OMP                                  nord_tr,nq,gridstruct,bd,cy,yfx,mfx,mfy,qn2,q,ra_x,ra_y,dp1,dp2,rarea,lim_fac) &
-!$OMP                          private(fx,fy)
-        do iq=1,nq
-        if ( nsplt /= 1 ) then
-           if ( it==1 ) then
-              do j=jsd,jed
-                 do i=isd,ied
-                    qn2(i,j,iq) = q(i,j,k,iq)
-                 enddo
-              enddo
-           endif
-           call fv_tp_2d(qn2(isd,jsd,iq), cx(is,jsd,k), cy(isd,js,k), &
-                         npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                         gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k))
-           if ( it < nsplt ) then   ! not last call
-              do j=js,je
-              do i=is,ie
-                 qn2(i,j,iq) = (qn2(i,j,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
-              enddo
-              enddo
-           else
-              do j=js,je
-              do i=is,ie
-                 q(i,j,k,iq) = (qn2(i,j,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
-              enddo
-              enddo
-           endif
-        else
-           call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
-                         npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                         gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k))
-           do j=js,je
-              do i=is,ie
-                 q(i,j,k,iq) = (q(i,j,k,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
-              enddo
-           enddo
-        endif
-        enddo   !  tracer-loop
-
-        if ( it < nsplt ) then   ! not last call
-             do j=js,je
-                do i=is,ie
-                   dp1(i,j,k) = dp2(i,j)
-                enddo
-             enddo
-                               call timing_on('COMM_TOTAL')
-                         call timing_on('COMM_TRACER')
-             call mpp_update_domains(qn2, domain)
-                        call timing_off('COMM_TRACER')
-                              call timing_off('COMM_TOTAL')
-        endif
-     enddo  ! time-split loop
-  enddo    ! k-loop
-
-end subroutine tracer_2d_1L
-
-!>@brief The subroutine 'tracer_2d' is the standard routine for sub-cycled tracer advection.
-subroutine tracer_2d(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
-                     nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, lim_fac)
-
-      type(fv_grid_bounds_type), intent(IN) :: bd
-      integer, intent(IN) :: npx
-      integer, intent(IN) :: npy
-      integer, intent(IN) :: npz
-      integer, intent(IN) :: nq    !< number of tracers to be advected
-      integer, intent(IN) :: hord, nord_tr
-      integer, intent(IN) :: q_split
-      integer, intent(IN) :: id_divg
-      real   , intent(IN) :: dt, trdm
-      real   , intent(IN) :: lim_fac
-      type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
-      real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
-      real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
-      real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
-      real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
-      real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
-      real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
-      type(fv_grid_type), intent(IN), target :: gridstruct
-      type(domain2d), intent(INOUT) :: domain
-
-! Local Arrays
-      real :: dp2(bd%is:bd%ie,bd%js:bd%je)
-      real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
-      real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
-      real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
-      real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
-      real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
-      real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
-      real :: cmax(npz)
-      real :: c_global
-      real :: frac, rdt
-      integer :: ksplt(npz)
-      integer :: nsplt
-      integer :: i,j,k,it,iq
-
-      real, pointer, dimension(:,:) :: area, rarea
-      real, pointer, dimension(:,:,:) :: sin_sg
-      real, pointer, dimension(:,:) :: dxa, dya, dx, dy
-
-      integer :: is,  ie,  js,  je
-      integer :: isd, ied, jsd, jed
-
-      is  = bd%is
-      ie  = bd%ie
-      js  = bd%js
-      je  = bd%je
-      isd = bd%isd
-      ied = bd%ied
-      jsd = bd%jsd
-      jed = bd%jed
-
-       area => gridstruct%area
-      rarea => gridstruct%rarea
-
-      sin_sg => gridstruct%sin_sg
-      dxa    => gridstruct%dxa
-      dya    => gridstruct%dya
-      dx     => gridstruct%dx
-      dy     => gridstruct%dy
-
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,dxa,dy, &
-!$OMP                                  sin_sg,cy,yfx,dya,dx,cmax,q_split,ksplt)
-    do k=1,npz
-       do j=jsd,jed
-          do i=is,ie+1
-             if (cx(i,j,k) > 0.) then
-                 xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
-             else
-                 xfx(i,j,k) = cx(i,j,k)*dxa(i,j)*dy(i,j)*sin_sg(i,j,1)
-             endif
-          enddo
-       enddo
-       do j=js,je+1
-          do i=isd,ied
-              if (cy(i,j,k) > 0.) then
-                  yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
-              else
-                  yfx(i,j,k) = cy(i,j,k)*dya(i,j)*dx(i,j)*sin_sg(i,j,2)
-              endif
-          enddo
-       enddo
-
-       if ( q_split == 0 ) then
-         cmax(k) = 0.
-         if ( k < npz/6 ) then
-            do j=js,je
-               do i=is,ie
-                  cmax(k) = max( cmax(k), abs(cx(i,j,k)), abs(cy(i,j,k)) )
-               enddo
-            enddo
-         else
-            do j=js,je
-               do i=is,ie
-                  cmax(k) = max( cmax(k), max(abs(cx(i,j,k)),abs(cy(i,j,k)))+1.-sin_sg(i,j,5) )
-               enddo
-            enddo
-         endif
-       endif
-       ksplt(k) = 1
-
-    enddo
-
-!--------------------------------------------------------------------------------
-
-! Determine global nsplt:
-  if ( q_split == 0 ) then
-      call mp_reduce_max(cmax,npz)
-! find global max courant number and define nsplt to scale cx,cy,mfx,mfy
-      c_global = cmax(1)
-      if ( npz /= 1 ) then                ! if NOT shallow water test case
-         do k=2,npz
-            c_global = max(cmax(k), c_global)
-         enddo
-      endif
-      nsplt = int(1. + c_global)
-      if ( is_master() .and. nsplt > 4 )  write(*,*) 'Tracer_2d_split=', nsplt, c_global
-   else
-      nsplt = q_split
-   endif
-
-!--------------------------------------------------------------------------------
-
-    if( nsplt /= 1 ) then
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,mfx,cy,yfx,mfy,cmax,nsplt,ksplt) &
-!$OMP                          private( frac )
-        do k=1,npz
-
-#ifdef GLOBAL_CFL
-           ksplt(k) = nsplt
-#else
-           ksplt(k) = int(1. + cmax(k))
-#endif
-           frac  = 1. / real(ksplt(k))
-
-           do j=jsd,jed
-              do i=is,ie+1
-                 cx(i,j,k) =   cx(i,j,k) * frac
-                 xfx(i,j,k) = xfx(i,j,k) * frac
-              enddo
-           enddo
-           do j=js,je
-              do i=is,ie+1
-                 mfx(i,j,k) = mfx(i,j,k) * frac
-              enddo
-           enddo
-
-           do j=js,je+1
-              do i=isd,ied
-                 cy(i,j,k) =  cy(i,j,k) * frac
-                yfx(i,j,k) = yfx(i,j,k) * frac
-              enddo
-           enddo
-           do j=js,je+1
-              do i=is,ie
-                mfy(i,j,k) = mfy(i,j,k) * frac
-              enddo
-           enddo
-
-        enddo
-    endif
-
-    if (trdm>1.e-4) then
-                        call timing_on('COMM_TOTAL')
-                            call timing_on('COMM_TRACER')
-      call complete_group_halo_update(dp1_pack, domain)
-                           call timing_off('COMM_TRACER')
-                       call timing_off('COMM_TOTAL')
-
-    endif
-    do it=1,nsplt
-                        call timing_on('COMM_TOTAL')
-                            call timing_on('COMM_TRACER')
-      call complete_group_halo_update(q_pack, domain)
-                           call timing_off('COMM_TRACER')
-                       call timing_off('COMM_TOTAL')
-
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,dp1,mfx,mfy,rarea,nq,ksplt,&
-!$OMP                                  area,xfx,yfx,q,cx,cy,npx,npy,hord,gridstruct,bd,it,nsplt,nord_tr,trdm,lim_fac) &
-!$OMP                          private(dp2, ra_x, ra_y, fx, fy)
-     do k=1,npz
-
-       if ( it .le. ksplt(k) ) then
-
-         do j=js,je
-            do i=is,ie
-               dp2(i,j) = dp1(i,j,k) + (mfx(i,j,k)-mfx(i+1,j,k)+mfy(i,j,k)-mfy(i,j+1,k))*rarea(i,j)
-            enddo
-         enddo
-
-         do j=jsd,jed
-            do i=is,ie
-               ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
-            enddo
-         enddo
-         do j=js,je
-            do i=isd,ied
-               ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
-            enddo
-         enddo
-
-         do iq=1,nq
-         if ( it==1 .and. trdm>1.e-4 ) then
-            call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
-                          npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                          gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k),   &
-                          mass=dp1(isd,jsd,k), nord=nord_tr, damp_c=trdm)
-         else
-            call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
-                          npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                          gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k))
-         endif
-            do j=js,je
-               do i=is,ie
-                  q(i,j,k,iq) = ( q(i,j,k,iq)*dp1(i,j,k) + &
-                                (fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j) )/dp2(i,j)
-               enddo
-               enddo
-            enddo
-
-         if ( it /= nsplt ) then
-              do j=js,je
-                 do i=is,ie
-                    dp1(i,j,k) = dp2(i,j)
-                 enddo
-              enddo
-         endif
-
-       endif   ! ksplt
-
-     enddo ! npz
-
-      if ( it /= nsplt ) then
-                      call timing_on('COMM_TOTAL')
-                          call timing_on('COMM_TRACER')
-           call start_group_halo_update(q_pack, q, domain)
-                          call timing_off('COMM_TRACER')
-                      call timing_off('COMM_TOTAL')
-      endif
-
-   enddo  ! nsplt
-
-
-end subroutine tracer_2d
-
-
-subroutine tracer_2d_nested(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
-                     nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, &
-                     k_split, neststruct, parent_grid, n_map, lim_fac)
-
-      type(fv_grid_bounds_type), intent(IN) :: bd
-      integer, intent(IN) :: npx
-      integer, intent(IN) :: npy
-      integer, intent(IN) :: npz
-      integer, intent(IN) :: nq    !< number of tracers to be advected
-      integer, intent(IN) :: hord, nord_tr
-      integer, intent(IN) :: q_split, k_split, n_map
-      integer, intent(IN) :: id_divg
-      real   , intent(IN) :: dt, trdm
-      real   , intent(IN) :: lim_fac
-      type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
-      real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
-      real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
-      real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
-      real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
-      real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
-      real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
-      type(fv_grid_type), intent(IN), target :: gridstruct
-      type(fv_nest_type), intent(INOUT) :: neststruct
-      type(fv_atmos_type), pointer, intent(IN) :: parent_grid
-      type(domain2d), intent(INOUT) :: domain
-
-! Local Arrays
-      real :: dp2(bd%is:bd%ie,bd%js:bd%je)
-      real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
-      real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
-      real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
-      real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
-      real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
-      real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
-      real :: cmax(npz)
-      real :: cmax_t
-      real :: c_global
-      real :: frac, rdt
-      real :: reg_bc_update_time
-      integer :: nsplt, nsplt_parent, msg_split_steps = 1
-      integer :: i,j,k,it,iq
-
-      real, pointer, dimension(:,:) :: area, rarea
-      real, pointer, dimension(:,:,:) :: sin_sg
-      real, pointer, dimension(:,:) :: dxa, dya, dx, dy
-
-      integer :: is,  ie,  js,  je
-      integer :: isd, ied, jsd, jed
-
-      is  = bd%is
-      ie  = bd%ie
-      js  = bd%js
-      je  = bd%je
-      isd = bd%isd
-      ied = bd%ied
-      jsd = bd%jsd
-      jed = bd%jed
-
-       area => gridstruct%area
-      rarea => gridstruct%rarea
-
-      sin_sg => gridstruct%sin_sg
-      dxa    => gridstruct%dxa
-      dya    => gridstruct%dya
-      dx     => gridstruct%dx
-      dy     => gridstruct%dy
-
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,dxa,dy, &
-!$OMP                                  sin_sg,cy,yfx,dya,dx)
-      do k=1,npz
+      nsplt = int(1. + cmax(k))
+      if ( nsplt > 1 ) then
+         frac  = 1. / real(nsplt)
          do j=jsd,jed
             do i=is,ie+1
-               if (cx(i,j,k) > 0.) then
-                  xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
-               else
-                  xfx(i,j,k) = cx(i,j,k)*dxa(i,j)*dy(i,j)*sin_sg(i,j,1)
-               endif
+                cx(i,j,k) =  cx(i,j,k) * frac
+               xfx(i,j,k) = xfx(i,j,k) * frac
+            enddo
+         enddo
+         do j=js,je
+            do i=is,ie+1
+               mfx(i,j,k) = mfx(i,j,k) * frac
             enddo
          enddo
          do j=js,je+1
             do i=isd,ied
-               if (cy(i,j,k) > 0.) then
-                  yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
-               else
-                  yfx(i,j,k) = cy(i,j,k)*dya(i,j)*dx(i,j)*sin_sg(i,j,2)
-               endif
+               cy(i,j,k) =  cy(i,j,k) * frac
+              yfx(i,j,k) = yfx(i,j,k) * frac
             enddo
          enddo
-      enddo
-
-!--------------------------------------------------------------------------------
-  if ( q_split == 0 ) then
-! Determine nsplt
-
-!$OMP parallel do default(none) shared(is,ie,js,je,npz,cmax,cx,cy,sin_sg) &
-!$OMP                          private(cmax_t )
-      do k=1,npz
-         cmax(k) = 0.
-         if ( k < 4 ) then
-! Top layers: C < max( abs(c_x), abs(c_y) )
-            do j=js,je
-               do i=is,ie
-                  cmax_t  = max( abs(cx(i,j,k)), abs(cy(i,j,k)) )
-                  cmax(k) = max( cmax_t, cmax(k) )
-               enddo
+         do j=js,je+1
+            do i=is,ie
+               mfy(i,j,k) = mfy(i,j,k) * frac
             enddo
-         else
-            do j=js,je
-               do i=is,ie
-                  cmax_t  = max(abs(cx(i,j,k)), abs(cy(i,j,k))) + 1.-sin_sg(i,j,5)
-                  cmax(k) = max( cmax_t, cmax(k) )
-               enddo
+         enddo
+      endif
+
+   enddo
+                                call timing_on('COMM_TOTAL')
+                          call timing_on('COMM_TRACER')
+   call complete_group_halo_update(q_pack, domain)
+                         call timing_off('COMM_TRACER')
+                               call timing_off('COMM_TOTAL')
+
+ ! Begin k-independent tracer transport; can not be OpenMPed because the mpp_update call.
+   do k=1,npz
+
+!$OMP parallel do default(none) shared(k,is,ie,js,je,isd,ied,jsd,jed,xfx,area,yfx,ra_x,ra_y)
+      do j=jsd,jed
+         do i=is,ie
+            ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
+         enddo
+         if ( j>=js .and. j<=je ) then
+            do i=isd,ied
+               ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
             enddo
          endif
       enddo
-      call mp_reduce_max(cmax,npz)
 
-! find global max courant number and define nsplt to scale cx,cy,mfx,mfy
-      c_global = cmax(1)
-      if ( npz /= 1 ) then                ! if NOT shallow water test case
-         do k=2,npz
-            c_global = max(cmax(k), c_global)
-         enddo
-      endif
-      nsplt = int(1. + c_global)
-      if ( is_master() .and. nsplt > 3 )  write(*,*) 'Tracer_2d_split=', nsplt, c_global
-   else
-      nsplt = q_split
-      if (gridstruct%nested .and. neststruct%nestbctype > 1) msg_split_steps = max(q_split/parent_grid%flagstruct%q_split,1)
-   endif
+      nsplt = int(1. + cmax(k))
+      do it=1,nsplt
 
-!--------------------------------------------------------------------------------
-
-   frac  = 1. / real(nsplt)
-
-      if( nsplt /= 1 ) then
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,frac,xfx,mfx,cy,yfx,mfy)
-          do k=1,npz
-             do j=jsd,jed
-                do i=is,ie+1
-                   cx(i,j,k) =  cx(i,j,k) * frac
-                   xfx(i,j,k) = xfx(i,j,k) * frac
-                enddo
-             enddo
-             do j=js,je
-                do i=is,ie+1
-                   mfx(i,j,k) = mfx(i,j,k) * frac
-                enddo
-             enddo
-
-             do j=js,je+1
-                do i=isd,ied
-                   cy(i,j,k) =  cy(i,j,k) * frac
-                  yfx(i,j,k) = yfx(i,j,k) * frac
-                enddo
-             enddo
-
-             do j=js,je+1
-                do i=is,ie
-                  mfy(i,j,k) = mfy(i,j,k) * frac
-                enddo
-             enddo
-          enddo
-      endif
-
-
-    do it=1,nsplt
-       if ( gridstruct%nested ) then
-          neststruct%tracer_nest_timestep = neststruct%tracer_nest_timestep + 1
-       end if
-                        call timing_on('COMM_TOTAL')
-                            call timing_on('COMM_TRACER')
-      call complete_group_halo_update(q_pack, domain)
-                           call timing_off('COMM_TRACER')
-                       call timing_off('COMM_TOTAL')
-
-      if (gridstruct%nested) then
-            do iq=1,nq
-                 call nested_grid_BC_apply_intT(q(isd:ied,jsd:jed,:,iq), &
-                      0, 0, npx, npy, npz, bd, &
-                      real(neststruct%tracer_nest_timestep)+real(nsplt*k_split), real(nsplt*k_split), &
-                 neststruct%q_BC(iq), bctype=neststruct%nestbctype  )
-           enddo
-      endif
-
-      if (gridstruct%regional) then
-            !This is more accurate than the nested BC calculation
-            ! since it takes into account varying nsplit
-            reg_bc_update_time=current_time_in_seconds+(real(n_map-1) + real(it-1)*frac)*dt
-            do iq=1,nq
-                 call regional_boundary_update(q(:,:,:,iq), 'q', &
-                                               isd, ied, jsd, jed, npz, &
-                                               is,  ie,  js,  je,       &
-                                               isd, ied, jsd, jed,      &
-                                               reg_bc_update_time,      &
-                                               it, iq )
-            enddo
-      endif
-
-      if (trdm>1.e-4) then
-                        call timing_on('COMM_TOTAL')
-                            call timing_on('COMM_TRACER')
-         call complete_group_halo_update(dp1_pack, domain)
-                           call timing_off('COMM_TRACER')
-                       call timing_off('COMM_TOTAL')
-
-      endif
-
-
-!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,dp1,mfx,mfy,rarea,nq, &
-!$OMP                                  area,xfx,yfx,q,cx,cy,npx,npy,hord,gridstruct,bd,it,nsplt,nord_tr,trdm,lim_fac) &
-!$OMP                          private(dp2, ra_x, ra_y, fx, fy)
-      do k=1,npz
-
+!$OMP parallel do default(none) shared(k,is,ie,js,je,rarea,mfx,mfy,dp1,dp2)
          do j=js,je
             do i=is,ie
                dp2(i,j) = dp1(i,j,k) + (mfx(i,j,k)-mfx(i+1,j,k)+mfy(i,j,k)-mfy(i,j+1,k))*rarea(i,j)
             enddo
          enddo
 
-         do j=jsd,jed
-            do i=is,ie
-               ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
+         if (trim(transport_scheme) == 'ff_cslam') then
+            ! CHANGED: FF-CSLAM branch: compute u,v for sub-timestep dt_split = dt / nsplt, call per split in-place
+            ! Timing for performance
+            call timing_on('CSLAM')
+            ! u,v from scaled cx,cy (already frac applied), dt full but since cx scaled, effective dt_split
+            real :: dt_split = dt / real(nsplt)
+            do j=jsd,jed
+               do i=is,ie+1
+                  u(i,j) = cx(i,j,k) * dxa(i,j) / dt_split  ! Full velocity for sub-step
+               enddo
             enddo
-         enddo
-         do j=js,je
-            do i=isd,ied
-               ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
+            do j=js,je+1
+               do i=isd,ied
+                  v(i,j) = cy(i,j,k) * dya(i,j) / dt_split
+               enddo
             enddo
-         enddo
-
-         do iq=1,nq
-         if ( it==1 .and. trdm>1.e-4 ) then
-            call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
-                          npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                          gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k),   &
-                          mass=dp1(isd,jsd,k), nord=nord_tr, damp_c=trdm)
+            ! Call ff_cslam_tr_multi in-place on q(...,k,:), no q_slice needed (updates progressively per it)
+            call ff_cslam_tr_multi(q(isd:ied,jsd:jed,k,:), u(is:ie+1,jsd:jed), v(isd:ied,js:je+1), gridstruct, dt_split, npx, npy, npz, &
+                                   isd, ied, jsd, jed, is, ie, js, je, nq, bd%bounds)
+            call timing_off('CSLAM')
          else
-            call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
-                          npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
-                          gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k))
+            ! Non-ff_cslam: keep existing loop over iq with fv_tp_2d
+!$OMP parallel do default(none) shared(k,nsplt,it,is,ie,js,je,isd,ied,jsd,jed,npx,npy,cx,xfx,hord,trdm, &
+!$OMP                                  nord_tr,nq,gridstruct,bd,cy,yfx,mfx,mfy,qn2,q,ra_x,ra_y,dp1,dp2,rarea,lim_fac,k) &
+!$OMP                          private(fx,fy,iq)
+            do iq=1,nq
+            if ( nsplt /= 1 ) then
+               if ( it==1 ) then
+                  do j=jsd,jed
+                     do i=isd,ied
+                        qn2(i,j,iq) = q(i,j,k,iq)
+                     enddo
+                  enddo
+               endif
+               call fv_tp_2d(qn2(isd,jsd,iq), cx(is,jsd,k), cy(isd,js,k), &
+                             npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                             gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme)
+            else
+               call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
+                             npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                             gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme)
+            endif
+            if ( nsplt /= 1 ) then
+               if ( it < nsplt ) then   ! not last call
+                  do j=js,je
+                  do i=is,ie
+                     qn2(i,j,iq) = (qn2(i,j,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
+                  enddo
+                  enddo
+               else
+                  do j=js,je
+                  do i=is,ie
+                     q(i,j,k,iq) = (qn2(i,j,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
+                  enddo
+                  enddo
+               endif
+            else
+               do j=js,je
+                  do i=is,ie
+                     q(i,j,k,iq) = (q(i,j,k,iq)*dp1(i,j,k)+(fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j))/dp2(i,j)
+                  enddo
+               enddo
+            endif
+            enddo   !  tracer-loop
          endif
-            do j=js,je
-               do i=is,ie
-                  q(i,j,k,iq) = ( q(i,j,k,iq)*dp1(i,j,k) + &
-                                (fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j) )/dp2(i,j)
-               enddo
-               enddo
-          enddo
-      enddo ! npz
 
-      if ( it /= nsplt ) then
-                      call timing_on('COMM_TOTAL')
+         if ( it < nsplt ) then   ! not last call (for CSLAM, dp1 updated from mfx/mfy div since no fx,fy)
+              do j=js,je
+                 do i=is,ie
+                    dp1(i,j,k) = dp2(i,j)  ! dp2 from mfx/mfy conservative
+                 enddo
+              enddo
+              ! Halo update only if non-CSLAM (CSLAM in-place handles via bounds)
+              if (trim(transport_scheme) /= 'ff_cslam') then
+                                call timing_on('COMM_TOTAL')
                           call timing_on('COMM_TRACER')
-           call start_group_halo_update(q_pack, q, domain)
+                 call mpp_update_domains(qn2, domain)
                           call timing_off('COMM_TRACER')
-                      call timing_off('COMM_TOTAL')
-      endif
+                                call timing_off('COMM_TOTAL')
+              end if
+         endif
+      enddo  ! time-split loop
+   enddo    ! k-loop
 
-   enddo  ! nsplt
+ end subroutine tracer_2d_1L
 
-   if ( id_divg > 0 ) then
-        rdt = 1./(frac*dt)
+ !>@brief The subroutine 'tracer_2d' is the standard routine for sub-cycled tracer advection.
+ subroutine tracer_2d(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
+                      nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, lim_fac, transport_scheme)
 
-!$OMP parallel do default(none) shared(is,ie,js,je,npz,dp1,xfx,yfx,rarea,rdt)
-        do k=1,npz
-        do j=js,je
-           do i=is,ie
-              dp1(i,j,k) = (xfx(i+1,j,k)-xfx(i,j,k) + yfx(i,j+1,k)-yfx(i,j,k))*rarea(i,j)*rdt
+       type(fv_grid_bounds_type), intent(IN) :: bd
+       integer, intent(IN) :: npx
+       integer, intent(IN) :: npy
+       integer, intent(IN) :: npz
+       integer, intent(IN) :: nq    !< number of tracers to be advected
+       integer, intent(IN) :: hord, nord_tr
+       integer, intent(IN) :: q_split
+       integer, intent(IN) :: id_divg
+       real   , intent(IN) :: dt, trdm
+       real   , intent(IN) :: lim_fac
+       type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
+       real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
+       real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
+       real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
+       real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
+       real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
+       real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
+       type(fv_grid_type), intent(IN), target :: gridstruct
+       type(domain2d), intent(INOUT) :: domain
+       character(len=*), intent(in) :: transport_scheme
+
+ ! Local Arrays
+       real :: dp2(bd%is:bd%ie,bd%js:bd%je)
+       real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
+       real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
+       real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
+       real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
+       real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
+       real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
+       real :: cmax(npz)
+       real :: c_global
+       real :: frac, rdt
+       integer :: ksplt(npz)
+       integer :: nsplt
+       integer :: i,j,k,it,iq
+       real :: u(bd%is:bd%ie+1,bd%jsd:bd%jed,npz), v(bd%isd:bd%ied,bd%js:bd%je+1,npz)
+       real :: q_slice(bd%isd:bd%ied,bd%jsd:bd%jed,nq)  ! OPTIMIZATION: Local slice for multi-tracer CSLAM
+
+       real, pointer, dimension(:,:) :: area, rarea
+       real, pointer, dimension(:,:,:) :: sin_sg
+       real, pointer, dimension(:,:) :: dxa, dya, dx, dy
+
+       integer :: is,  ie,  js,  je
+       integer :: isd, ied, jsd, jed
+
+       is  = bd%is
+       ie  = bd%ie
+       js  = bd%js
+       je  = bd%je
+       isd = bd%isd
+       ied = bd%ied
+       jsd = bd%jsd
+       jed = bd%jed
+
+        area => gridstruct%area
+       rarea => gridstruct%rarea
+
+       sin_sg => gridstruct%sin_sg
+       dxa    => gridstruct%dxa
+       dya    => gridstruct%dya
+       dx     => gridstruct%dx
+       dy     => gridstruct%dy
+
+!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,dxa,dy, &
+!$OMP                                  sin_sg,cy,yfx,dya,dx,cmax,q_split,ksplt)
+     do k=1,npz
+        do j=jsd,jed
+           do i=is,ie+1
+              if (cx(i,j,k) > 0.) then
+                  xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
+              else
+                  xfx(i,j,k) = cx(i,j,k)*dxa(i,j)*dy(i,j)*sin_sg(i,j,1)
+              endif
            enddo
         enddo
+        do j=js,je+1
+           do i=isd,ied
+               if (cy(i,j,k) > 0.) then
+                   yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
+               else
+                   yfx(i,j,k) = cy(i,j,k)*dya(i,j)*dx(i,j)*sin_sg(i,j,2)
+               endif
+           enddo
         enddo
-   endif
 
- end subroutine tracer_2d_nested
+        if ( q_split == 0 ) then
+          cmax(k) = 0.
+          if ( k < npz/6 ) then
+             do j=js,je
+                do i=is,ie
+                   cmax(k) = max( cmax(k), abs(cx(i,j,k)), abs(cy(i,j,k)) )
+                enddo
+             enddo
+          else
+             do j=js,je
+                do i=is,ie
+                   cmax(k) = max( cmax(k), max(abs(cx(i,j,k)),abs(cy(i,j,k)))+1.-sin_sg(i,j,5) )
+                enddo
+             enddo
+          endif
+        endif
+        ksplt(k) = 1
+
+     enddo
+
+ !--------------------------------------------------------------------------------
+
+ ! Determine global nsplt:
+   if ( q_split == 0 ) then
+       call mp_reduce_max(cmax,npz)
+ ! find global max courant number and define nsplt to scale cx,cy,mfx,mfy
+       c_global = cmax(1)
+       if ( npz /= 1 ) then                ! if NOT shallow water test case
+          do k=2,npz
+             c_global = max(cmax(k), c_global)
+          enddo
+       endif
+       nsplt = int(1. + c_global)
+       if ( is_master() .and. nsplt > 4 )  write(*,*) 'Tracer_2d_split=', nsplt, c_global
+    else
+       nsplt = q_split
+    endif
+
+ !--------------------------------------------------------------------------------
+
+     if( nsplt /= 1 ) then
+ !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,mfx,cy,yfx,mfy,cmax,nsplt,ksplt) &
+ !$OMP                          private( frac )
+         do k=1,npz
+
+ #ifdef GLOBAL_CFL
+            ksplt(k) = nsplt
+ #else
+            ksplt(k) = int(1. + cmax(k))
+ #endif
+            frac  = 1. / real(ksplt(k))
+
+            do j=jsd,jed
+               do i=is,ie+1
+                  cx(i,j,k) =   cx(i,j,k) * frac
+                  xfx(i,j,k) = xfx(i,j,k) * frac
+               enddo
+            enddo
+            do j=js,je
+               do i=is,ie+1
+                  mfx(i,j,k) = mfx(i,j,k) * frac
+               enddo
+            enddo
+
+            do j=js,je+1
+               do i=isd,ied
+                  cy(i,j,k) =  cy(i,j,k) * frac
+                 yfx(i,j,k) = yfx(i,j,k) * frac
+               enddo
+            enddo
+            do j=js,je+1
+               do i=is,ie
+                 mfy(i,j,k) = mfy(i,j,k) * frac
+               enddo
+            enddo
+
+         enddo
+     endif
+
+     if (trdm>1.e-4) then
+                         call timing_on('COMM_TOTAL')
+                             call timing_on('COMM_TRACER')
+       call complete_group_halo_update(dp1_pack, domain)
+                            call timing_off('COMM_TRACER')
+                        call timing_off('COMM_TOTAL')
+
+     endif
+     do it=1,nsplt
+                         call timing_on('COMM_TOTAL')
+                             call timing_on('COMM_TRACER')
+       call complete_group_halo_update(q_pack, domain)
+                            call timing_off('COMM_TRACER')
+                        call timing_off('COMM_TOTAL')
+
+ !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,dp1,mfx,mfy,rarea,nq,ksplt,&
+ !$OMP                                  area,xfx,yfx,q,cx,cy,npx,npy,hord,gridstruct,bd,it,nsplt,nord_tr,trdm,lim_fac,transport_scheme,u,v,q_slice,dt,dxa,dya) &
+ !$OMP                          private(dp2, ra_x, ra_y, fx, fy,iq)
+      do k=1,npz
+
+        if ( it .le. ksplt(k) ) then
+
+          do j=js,je
+             do i=is,ie
+                dp2(i,j) = dp1(i,j,k) + (mfx(i,j,k)-mfx(i+1,j,k)+mfy(i,j,k)-mfy(i,j+1,k))*rarea(i,j)
+             enddo
+          enddo
+
+          do j=jsd,jed
+             do i=is,ie
+                ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
+             enddo
+          enddo
+          do j=js,je
+             do i=isd,ied
+                ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
+             enddo
+          enddo
+
+          if (trim(transport_scheme) == 'ff_cslam') then
+             ! CHANGED: FF-CSLAM branch: similar to _1L, per split with dt_split
+             call timing_on('CSLAM')
+             real :: dt_split = dt / real(ksplt(k))
+             do j=jsd,jed
+                do i=is,ie+1
+                   u(i,j,k) = cx(i,j,k) * dxa(i,j) / dt_split
+                enddo
+             enddo
+             do j=js,je+1
+                do i=isd,ied
+                   v(i,j,k) = cy(i,j,k) * dya(i,j) / dt_split
+                enddo
+             enddo
+             ! In-place call per split
+             call ff_cslam_tr_multi(q(isd:ied,jsd:jed,k,:), u(is:ie+1,jsd:jed,k), v(isd:ied,js:je+1,k), gridstruct, dt_split, npx, npy, npz, &
+                                    isd, ied, jsd, jed, is, ie, js, je, nq, bd%bounds)
+             call timing_off('CSLAM')
+          else
+             ! Non-ff_cslam: keep existing loop over iq with fv_tp_2d
+             do iq=1,nq
+                if ( it==1 .and. trdm>1.e-4 ) then
+                   call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
+                                 npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                                 gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme,   &
+                                 mass=dp1(isd,jsd,k), nord=nord_tr, damp_c=trdm)
+                else
+                   call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
+                                 npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                                 gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme)
+                endif
+                   do j=js,je
+                      do i=is,ie
+                         q(i,j,k,iq) = ( q(i,j,k,iq)*dp1(i,j,k) + &
+                                       (fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j) )/dp2(i,j)
+                      enddo
+                      enddo
+             enddo
+          endif
+
+          if ( it /= ksplt(k) ) then
+               do j=js,je
+                  do i=is,ie
+                     dp1(i,j,k) = dp2(i,j)
+                  enddo
+               enddo
+          endif
+
+        endif   ! ksplt
+
+      enddo ! npz
+
+       if ( it /= nsplt ) then
+                       call timing_on('COMM_TOTAL')
+                           call timing_on('COMM_TRACER')
+            call start_group_halo_update(q_pack, q, domain)
+                           call timing_off('COMM_TRACER')
+                       call timing_off('COMM_TOTAL')
+       endif
+
+    enddo  ! nsplt
+
+
+ end subroutine tracer_2d
+
+
+ subroutine tracer_2d_nested(q, dp1, mfx, mfy, cx, cy, gridstruct, bd, domain, npx, npy, npz,   &
+                      nq,  hord, q_split, dt, id_divg, q_pack, dp1_pack, nord_tr, trdm, lim_fac, transport_scheme, &
+                      k_split, neststruct, parent_grid, n_map)
+   character(len=*), intent(in) :: transport_scheme
+
+       type(fv_grid_bounds_type), intent(IN) :: bd
+       integer, intent(IN) :: npx
+       integer, intent(IN) :: npy
+       integer, intent(IN) :: npz
+       integer, intent(IN) :: nq    !< number of tracers to be advected
+       integer, intent(IN) :: hord, nord_tr
+       integer, intent(IN) :: q_split, k_split, n_map
+       integer, intent(IN) :: id_divg
+       real   , intent(IN) :: dt, trdm
+       real   , intent(IN) :: lim_fac
+       type(group_halo_update_type), intent(inout) :: q_pack, dp1_pack
+       real   , intent(INOUT) :: q(bd%isd:bd%ied,bd%jsd:bd%jed,npz,nq)   !< Tracers
+       real   , intent(INOUT) :: dp1(bd%isd:bd%ied,bd%jsd:bd%jed,npz)    !< DELP before dyn_core
+       real   , intent(INOUT) :: mfx(bd%is:bd%ie+1,bd%js:bd%je,  npz)    !< Mass Flux X-Dir
+       real   , intent(INOUT) :: mfy(bd%is:bd%ie  ,bd%js:bd%je+1,npz)    !< Mass Flux Y-Dir
+       real   , intent(INOUT) ::  cx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)  !< Courant Number X-Dir
+       real   , intent(INOUT) ::  cy(bd%isd:bd%ied,bd%js :bd%je +1,npz)  !< Courant Number Y-Dir
+       type(fv_grid_type), intent(IN), target :: gridstruct
+       type(fv_nest_type), intent(INOUT) :: neststruct
+       type(fv_atmos_type), pointer, intent(IN) :: parent_grid
+       type(domain2d), intent(INOUT) :: domain
+       real :: u(bd%is:bd%ie+1,bd%jsd:bd%jed,npz), v(bd%isd:bd%ied,bd%js:bd%je+1,npz)
+       real :: q_slice(bd%isd:bd%ied,bd%jsd:bd%jed,nq)
+       real :: dt_split
+       integer :: nsplt, it, iq, k
+
+ ! Local Arrays
+       real :: dp2(bd%is:bd%ie,bd%js:bd%je)
+       real :: fx(bd%is:bd%ie+1,bd%js:bd%je )
+       real :: fy(bd%is:bd%ie , bd%js:bd%je+1)
+       real :: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
+       real :: ra_y(bd%isd:bd%ied,bd%js:bd%je)
+       real :: xfx(bd%is:bd%ie+1,bd%jsd:bd%jed  ,npz)
+       real :: yfx(bd%isd:bd%ied,bd%js: bd%je+1, npz)
+       real :: cmax(npz)
+       real :: cmax_t
+       real :: c_global
+       real :: frac, rdt
+       real :: reg_bc_update_time
+       integer :: nsplt, nsplt_parent, msg_split_steps = 1
+       integer :: i,j,k,it,iq
+
+       real, pointer, dimension(:,:) :: area, rarea
+       real, pointer, dimension(:,:,:) :: sin_sg
+       real, pointer, dimension(:,:) :: dxa, dya, dx, dy
+
+       integer :: is,  ie,  js,  je
+       integer :: isd, ied, jsd, jed
+
+       is  = bd%is
+       ie  = bd%ie
+       js  = bd%js
+       je  = bd%je
+       isd = bd%isd
+       ied = bd%ied
+       jsd = bd%jsd
+       jed = bd%jed
+
+        area => gridstruct%area
+       rarea => gridstruct%rarea
+
+       sin_sg => gridstruct%sin_sg
+       dxa    => gridstruct%dxa
+       dya    => gridstruct%dya
+       dx     => gridstruct%dx
+       dy     => gridstruct%dy
+
+!$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,xfx,dxa,dy, &
+!$OMP                                  sin_sg,cy,yfx,dya,dx,u,v)
+       do k=1,npz
+          do j=jsd,jed
+             do i=is,ie+1
+                if (cx(i,j,k) > 0.) then
+                   xfx(i,j,k) = cx(i,j,k)*dxa(i-1,j)*dy(i,j)*sin_sg(i-1,j,3)
+                else
+                   xfx(i,j,k) = cx(i,j,k)*dxa(i,j)*dy(i,j)*sin_sg(i,j,1)
+                endif
+                u(i,j,k) = cx(i,j,k) * dxa(i,j)  ! Store scaled u (for later /dt_split)
+             enddo
+          enddo
+          do j=js,je+1
+             do i=isd,ied
+                if (cy(i,j,k) > 0.) then
+                   yfx(i,j,k) = cy(i,j,k)*dya(i,j-1)*dx(i,j)*sin_sg(i,j-1,4)
+                else
+                   yfx(i,j,k) = cy(i,j,k)*dya(i,j)*dx(i,j)*sin_sg(i,j,2)
+                endif
+                v(i,j,k) = cy(i,j,k) * dya(i,j)  ! Scaled v
+             enddo
+          enddo
+       enddo
+
+ !--------------------------------------------------------------------------------
+   if ( q_split == 0 ) then
+ ! Determine nsplt
+
+ !$OMP parallel do default(none) shared(is,ie,js,je,npz,cmax,cx,cy,sin_sg) &
+ !$OMP                          private(cmax_t )
+       do k=1,npz
+          cmax(k) = 0.
+          if ( k < 4 ) then
+ ! Top layers: C < max( abs(c_x), abs(c_y) )
+             do j=js,je
+                do i=is,ie
+                   cmax_t  = max( abs(cx(i,j,k)), abs(cy(i,j,k)) )
+                   cmax(k) = max( cmax_t, cmax(k) )
+                enddo
+             enddo
+          else
+             do j=js,je
+                do i=is,ie
+                   cmax_t  = max(abs(cx(i,j,k)), abs(cy(i,j,k))) + 1.-sin_sg(i,j,5)
+                   cmax(k) = max( cmax_t, cmax(k) )
+                enddo
+             enddo
+          endif
+       enddo
+       call mp_reduce_max(cmax,npz)
+
+ ! find global max courant number and define nsplt to scale cx,cy,mfx,mfy
+       c_global = cmax(1)
+       if ( npz /= 1 ) then                ! if NOT shallow water test case
+          do k=2,npz
+             c_global = max(cmax(k), c_global)
+          enddo
+       endif
+       nsplt = int(1. + c_global)
+       if ( is_master() .and. nsplt > 3 )  write(*,*) 'Tracer_2d_split=', nsplt, c_global
+    else
+       nsplt = q_split
+       if (gridstruct%nested .and. neststruct%nestbctype > 1) msg_split_steps = max(q_split/parent_grid%flagstruct%q_split,1)
+    endif
+
+ !--------------------------------------------------------------------------------
+
+    frac  = 1. / real(nsplt)
+
+       if( nsplt /= 1 ) then
+ !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,cx,frac,xfx,mfx,cy,yfx,mfy)
+           do k=1,npz
+              do j=jsd,jed
+                 do i=is,ie+1
+                    cx(i,j,k) =  cx(i,j,k) * frac
+                    xfx(i,j,k) = xfx(i,j,k) * frac
+                 enddo
+              enddo
+              do j=js,je
+                 do i=is,ie+1
+                    mfx(i,j,k) = mfx(i,j,k) * frac
+                 enddo
+              enddo
+
+              do j=js,je+1
+                 do i=isd,ied
+                    cy(i,j,k) =  cy(i,j,k) * frac
+                   yfx(i,j,k) = yfx(i,j,k) * frac
+                 enddo
+              enddo
+
+              do j=js,je+1
+                 do i=is,ie
+                   mfy(i,j,k) = mfy(i,j,k) * frac
+                 enddo
+              enddo
+           enddo
+       endif
+
+
+     do it=1,nsplt
+        if ( gridstruct%nested ) then
+           neststruct%tracer_nest_timestep = neststruct%tracer_nest_timestep + 1
+        end if
+                         call timing_on('COMM_TOTAL')
+                             call timing_on('COMM_TRACER')
+       call complete_group_halo_update(q_pack, domain)
+                            call timing_off('COMM_TRACER')
+                        call timing_off('COMM_TOTAL')
+
+       if (gridstruct%nested) then
+             do iq=1,nq
+                  call nested_grid_BC_apply_intT(q(isd:ied,jsd:jed,:,iq), &
+                       0, 0, npx, npy, npz, bd, &
+                       real(neststruct%tracer_nest_timestep)+real(nsplt*k_split), real(nsplt*k_split), &
+                  neststruct%q_BC(iq), bctype=neststruct%nestbctype  )
+            enddo
+       endif
+
+       if (gridstruct%regional) then
+             !This is more accurate than the nested BC calculation
+             ! since it takes into account varying nsplit
+             reg_bc_update_time=current_time_in_seconds+(real(n_map-1) + real(it-1)*frac)*dt
+             do iq=1,nq
+                  call regional_boundary_update(q(:,:,:,iq), 'q', &
+                                                isd, ied, jsd, jed, npz, &
+                                                is,  ie,  js,  je,       &
+                                                isd, ied, jsd, jed,      &
+                                                reg_bc_update_time,      &
+                                                it, iq )
+             enddo
+       endif
+
+       if (trdm>1.e-4) then
+                         call timing_on('COMM_TOTAL')
+                             call timing_on('COMM_TRACER')
+          call complete_group_halo_update(dp1_pack, domain)
+                            call timing_off('COMM_TRACER')
+                        call timing_off('COMM_TOTAL')
+
+       endif
+
+
+ !$OMP parallel do default(none) shared(is,ie,js,je,isd,ied,jsd,jed,npz,dp1,mfx,mfy,rarea,nq, &
+ !$OMP                                  area,xfx,yfx,q,cx,cy,npx,npy,hord,gridstruct,bd,it,nsplt,nord_tr,trdm,lim_fac,transport_scheme,u,v) &
+ !$OMP                          private(dp2, ra_x, ra_y, fx, fy, k, dt_split)
+       do k=1,npz
+
+          do j=js,je
+             do i=is,ie
+                dp2(i,j) = dp1(i,j,k) + (mfx(i,j,k)-mfx(i+1,j,k)+mfy(i,j,k)-mfy(i,j+1,k))*rarea(i,j)
+             enddo
+          enddo
+
+          do j=jsd,jed
+             do i=is,ie
+                ra_x(i,j) = area(i,j) + xfx(i,j,k) - xfx(i+1,j,k)
+             enddo
+          enddo
+          do j=js,je
+             do i=isd,ied
+                ra_y(i,j) = area(i,j) + yfx(i,j,k) - yfx(i,j+1,k)
+             enddo
+          enddo
+
+          if (trim(transport_scheme) == 'ff_cslam') then
+             ! CHANGED: Add FF-CSLAM branch for nested: similar to tracer_2d, with BC handle
+             call timing_on('CSLAM')
+             dt_split = dt / real(nsplt)
+             ! u,v already scaled in earlier loop; /dt_split for full vel
+             do j=jsd,jed
+               do i=is,ie+1
+                  u(i,j,k) = u(i,j,k) / dt_split
+               end do
+             end do
+             do j=js,je+1
+               do i=isd,ied
+                  v(i,j,k) = v(i,j,k) / dt_split
+               end do
+             end do
+             call ff_cslam_tr_multi(q(isd:ied,jsd:jed,k,:), u(is:ie+1,jsd:jed,k), v(isd:ied,js:je+1,k), gridstruct, dt_split, npx, npy, npz, &
+                                    isd, ied, jsd, jed, is, ie, js, je, nq, bd%bounds)
+             call timing_off('CSLAM')
+             ! For nested, apply BC after CSLAM if needed, but since in-place with bounds, ok
+          else
+             do iq=1,nq
+             if (trim(transport_scheme) == 'ff_cslam') then
+                ! CSLAM in nested: timing, dt_split
+                call timing_on('CSLAM')
+                dt_split = dt / real(nsplt)
+                do j=jsd,jed
+                   do i=is,ie+1
+                      u(i,j,k) = u(i,j,k) / dt_split
+                   enddo
+                enddo
+                do j=js,je+1
+                   do i=isd,ied
+                      v(i,j,k) = v(i,j,k) / dt_split
+                   enddo
+                enddo
+                call ff_cslam_tr_multi(q(isd:ied,jsd:jed,k,:), u(is:ie+1,jsd:jed,k), v(isd:ied,js:je+1,k), gridstruct, dt_split, npx, npy, npz, &
+                                       isd, ied, jsd, jed, is, ie, js, je, nq, bd%bounds)
+                call timing_off('CSLAM')
+             else
+                if ( it==1 .and. trdm>1.e-4 ) then
+                   call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
+                                 npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                                 gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme,   &
+                                 mass=dp1(isd,jsd,k), nord=nord_tr, damp_c=trdm)
+                else
+                   call fv_tp_2d(q(isd,jsd,k,iq), cx(is,jsd,k), cy(isd,js,k), &
+                                 npx, npy, hord, fx, fy, xfx(is,jsd,k), yfx(isd,js,k), &
+                                 gridstruct, bd, ra_x, ra_y, lim_fac, mfx=mfx(is,js,k), mfy=mfy(is,js,k), dt, transport_scheme)
+                endif
+             endif
+                do j=js,je
+                   do i=is,ie
+                      q(i,j,k,iq) = ( q(i,j,k,iq)*dp1(i,j,k) + &
+                                    (fx(i,j)-fx(i+1,j)+fy(i,j)-fy(i,j+1))*rarea(i,j) )/dp2(i,j)
+                   enddo
+                   enddo
+              enddo
+          end if
+       enddo ! npz
+
+       if ( it /= nsplt .and. trim(transport_scheme) /= 'ff_cslam' ) then
+                       call timing_on('COMM_TOTAL')
+                           call timing_on('COMM_TRACER')
+            call start_group_halo_update(q_pack, q, domain)
+                           call timing_off('COMM_TRACER')
+                       call timing_off('COMM_TOTAL')
+       endif
+
+    enddo  ! nsplt
+
+    if ( id_divg > 0 ) then
+         rdt = 1./(frac*dt)
+
+ !$OMP parallel do default(none) shared(is,ie,js,je,npz,dp1,xfx,yfx,rarea,rdt)
+         do k=1,npz
+         do j=js,je
+            do i=is,ie
+               dp1(i,j,k) = (xfx(i+1,j,k)-xfx(i,j,k) + yfx(i,j+1,k)-yfx(i,j,k))*rarea(i,j)*rdt
+            enddo
+         enddo
+         enddo
+    endif
+
+  end subroutine tracer_2d_nested
 
 end module fv_tracer2d_mod

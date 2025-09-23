@@ -108,145 +108,160 @@ contains
 !! \cite putman2007finite \cite lin1996multiflux.
 !>@details It performs 1 time step of the forward advection.
  subroutine fv_tp_2d(q, crx, cry, npx, npy, hord, fx, fy, xfx, yfx,  &
-                     gridstruct, bd, ra_x, ra_y, lim_fac, mfx, mfy, mass, nord, damp_c)
-   type(fv_grid_bounds_type), intent(IN) :: bd
-   integer, intent(in):: npx, npy
-   integer, intent(in)::hord
+                    gridstruct, bd, ra_x, ra_y, lim_fac, mfx, mfy, mass, nord, damp_c, &
+                    use_ff_cslam)
+  type(fv_grid_bounds_type), intent(IN) :: bd
+  integer, intent(in):: npx, npy
+  integer, intent(in)::hord
 
-   real, intent(in)::  crx(bd%is:bd%ie+1,bd%jsd:bd%jed)
-   real, intent(in)::  xfx(bd%is:bd%ie+1,bd%jsd:bd%jed)
-   real, intent(in)::  cry(bd%isd:bd%ied,bd%js:bd%je+1 )
-   real, intent(in)::  yfx(bd%isd:bd%ied,bd%js:bd%je+1 )
-   real, intent(in):: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
-   real, intent(in):: ra_y(bd%isd:bd%ied,bd%js:bd%je)
-   real, intent(inout):: q(bd%isd:bd%ied,bd%jsd:bd%jed)  !< transported scalar
-   real, intent(out)::fx(bd%is:bd%ie+1 ,bd%js:bd%je)    !< Flux in x ( E )
-   real, intent(out)::fy(bd%is:bd%ie,   bd%js:bd%je+1 ) !< Flux in y ( N )
+  real, intent(in)::  crx(bd%is:bd%ie+1,bd%jsd:bd%jed)
+  real, intent(in)::  xfx(bd%is:bd%ie+1,bd%jsd:bd%jed)
+  real, intent(in)::  cry(bd%isd:bd%ied,bd%js:bd%je+1 )
+  real, intent(in)::  yfx(bd%isd:bd%ied,bd%js:bd%je+1 )
+  real, intent(in):: ra_x(bd%is:bd%ie,bd%jsd:bd%jed)
+  real, intent(in):: ra_y(bd%isd:bd%ied,bd%js:bd%je)
+  real, intent(inout):: q(bd%isd:bd%ied,bd%jsd:bd%jed)  !< transported scalar
+  real, intent(out)::fx(bd%is:bd%ie+1 ,bd%js:bd%je)    !< Flux in x ( E )
+  real, intent(out)::fy(bd%is:bd%ie,   bd%js:bd%je+1 ) !< Flux in y ( N )
 
-   type(fv_grid_type), intent(IN), target :: gridstruct
+  type(fv_grid_type), intent(IN), target :: gridstruct
 
-   real, intent(in):: lim_fac
+  real, intent(in):: lim_fac
 ! optional Arguments:
-   real, OPTIONAL, intent(in):: mfx(bd%is:bd%ie+1,bd%js:bd%je  ) !< Mass Flux X-Dir
-   real, OPTIONAL, intent(in):: mfy(bd%is:bd%ie  ,bd%js:bd%je+1)  !< Mass Flux Y-Dir
-   real, OPTIONAL, intent(in):: mass(bd%isd:bd%ied,bd%jsd:bd%jed)
-   real, OPTIONAL, intent(in):: damp_c
-   integer, OPTIONAL, intent(in):: nord !< order of divergence damping
+  real, OPTIONAL, intent(in):: mfx(bd%is:bd%ie+1,bd%js:bd%je  ) !< Mass Flux X-Dir
+  real, OPTIONAL, intent(in):: mfy(bd%is:bd%ie  ,bd%js:bd%je+1)  !< Mass Flux Y-Dir
+  real, OPTIONAL, intent(in):: mass(bd%isd:bd%ied,bd%jsd:bd%jed)
+  real, OPTIONAL, intent(in):: damp_c
+  integer, OPTIONAL, intent(in):: nord !< order of divergence damping
+  logical, OPTIONAL, intent(in) :: use_ff_cslam
 ! Local:
-   integer ord_ou, ord_in
-   real q_i(bd%isd:bd%ied,bd%js:bd%je)
-   real q_j(bd%is:bd%ie,bd%jsd:bd%jed)
-   real   fx2(bd%is:bd%ie+1,bd%jsd:bd%jed)
-   real   fy2(bd%isd:bd%ied,bd%js:bd%je+1)
-   real   fyy(bd%isd:bd%ied,bd%js:bd%je+1)
-   real   fx1(bd%is:bd%ie+1)
-   real   damp
-   integer i, j
+  logical :: use_cslam
+  integer ord_ou, ord_in
+  real q_i(bd%isd:bd%ied,bd%js:bd%je)
+  real q_j(bd%is:bd%ie,bd%jsd:bd%jed)
+  real   fx2(bd%is:bd%ie+1,bd%jsd:bd%jed)
+  real   fy2(bd%isd:bd%ied,bd%js:bd%je+1)
+  real   fyy(bd%isd:bd%ied,bd%js:bd%je+1)
+  real   fx1(bd%is:bd%ie+1)
+  real   damp
+  integer i, j
 
-   integer:: is, ie, js, je, isd, ied, jsd, jed
+  integer:: is, ie, js, je, isd, ied, jsd, jed
 
-   is  = bd%is
-   ie  = bd%ie
-   js  = bd%js
-   je  = bd%je
-   isd = bd%isd
-   ied = bd%ied
-   jsd = bd%jsd
-   jed = bd%jed
+  is  = bd%is
+  ie  = bd%ie
+  js  = bd%js
+  je  = bd%je
+  isd = bd%isd
+  ied = bd%ied
+  jsd = bd%jsd
+  jed = bd%jed
 
-   if ( hord == 10 ) then
-        ord_in = 8
-   else
-        ord_in = hord
-   endif
-   ord_ou = hord
+  use_cslam = .false.
+  if (present(use_ff_cslam)) use_cslam = use_ff_cslam
 
-   if (.not. gridstruct%bounded_domain) &
-      call copy_corners(q, npx, npy, 2, gridstruct%bounded_domain, bd, &
+  if (use_cslam) then
+     ! Call ff_cslam for 2D horizontal transport (npz=1)
+     call main_ff_cslam_2d(q, crx, xfx, cry, yfx, bd%isd, bd%ied, bd%jsd, bd%jed, &
+                           is, ie, js, je, npx, npy, 1, gridstruct, bd)
+     ! For compatibility, set fluxes to zero since ff_cslam updates q in place
+     fx = 0.0
+     fy = 0.0
+  else
+     if ( hord == 10 ) then
+          ord_in = 8
+     else
+          ord_in = hord
+     endif
+     ord_ou = hord
+
+     if (.not. gridstruct%bounded_domain) &
+        call copy_corners(q, npx, npy, 2, gridstruct%bounded_domain, bd, &
+                           gridstruct%sw_corner, gridstruct%se_corner, gridstruct%nw_corner, gridstruct%ne_corner)
+
+     call yppm(fy2, q, cry, ord_in, isd,ied,isd,ied, js,je,jsd,jed, npx,npy, gridstruct%dya, &
+               gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
+
+     do j=js,je+1
+        do i=isd,ied
+           fyy(i,j) = yfx(i,j) * fy2(i,j)
+        enddo
+     enddo
+     do j=js,je
+        do i=isd,ied
+           q_i(i,j) = (q(i,j)*gridstruct%area(i,j) + fyy(i,j)-fyy(i,j+1))/ra_y(i,j)
+        enddo
+     enddo
+
+     call xppm(fx, q_i, crx(is,js), ord_ou, is,ie,isd,ied, js,je,jsd,jed, npx,npy, &
+               gridstruct%dxa, gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
+
+     if (.not. gridstruct%bounded_domain) &
+       call copy_corners(q, npx, npy, 1, gridstruct%bounded_domain, bd, &
                          gridstruct%sw_corner, gridstruct%se_corner, gridstruct%nw_corner, gridstruct%ne_corner)
 
-   call yppm(fy2, q, cry, ord_in, isd,ied,isd,ied, js,je,jsd,jed, npx,npy, gridstruct%dya, &
-             gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
+     call xppm(fx2, q, crx, ord_in, is,ie,isd,ied, jsd,jed,jsd,jed, npx,npy, gridstruct%dxa, &
+               gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
 
-   do j=js,je+1
-      do i=isd,ied
-         fyy(i,j) = yfx(i,j) * fy2(i,j)
-      enddo
-   enddo
-   do j=js,je
-      do i=isd,ied
-         q_i(i,j) = (q(i,j)*gridstruct%area(i,j) + fyy(i,j)-fyy(i,j+1))/ra_y(i,j)
-      enddo
-   enddo
+     do j=jsd,jed
+        do i=is,ie+1
+           fx1(i) =  xfx(i,j) * fx2(i,j)
+        enddo
+        do i=is,ie
+           q_j(i,j) = (q(i,j)*gridstruct%area(i,j) + fx1(i)-fx1(i+1))/ra_x(i,j)
+        enddo
+     enddo
 
-   call xppm(fx, q_i, crx(is,js), ord_ou, is,ie,isd,ied, js,je,jsd,jed, npx,npy, &
-             gridstruct%dxa, gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
+     call yppm(fy, q_j, cry, ord_ou, is,ie,isd,ied, js,je,jsd,jed, npx, npy, gridstruct%dya, &
+               gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
 
-   if (.not. gridstruct%bounded_domain) &
-     call copy_corners(q, npx, npy, 1, gridstruct%bounded_domain, bd, &
-                       gridstruct%sw_corner, gridstruct%se_corner, gridstruct%nw_corner, gridstruct%ne_corner)
+  !----------------
+  ! Flux averaging:
+  !----------------
 
-   call xppm(fx2, q, crx, ord_in, is,ie,isd,ied, jsd,jed,jsd,jed, npx,npy, gridstruct%dxa, &
-             gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
-
-   do j=jsd,jed
-      do i=is,ie+1
-         fx1(i) =  xfx(i,j) * fx2(i,j)
-      enddo
-      do i=is,ie
-         q_j(i,j) = (q(i,j)*gridstruct%area(i,j) + fx1(i)-fx1(i+1))/ra_x(i,j)
-      enddo
-   enddo
-
-   call yppm(fy, q_j, cry, ord_ou, is,ie,isd,ied, js,je,jsd,jed, npx, npy, gridstruct%dya, &
-             gridstruct%bounded_domain, gridstruct%grid_type, lim_fac)
-
-!----------------
-! Flux averaging:
-!----------------
-
-   if ( present(mfx) .and. present(mfy) ) then
-!---------------------------------
-! For transport of pt and tracers
-!---------------------------------
-      do j=js,je
-         do i=is,ie+1
-            fx(i,j) = 0.5*(fx(i,j) + fx2(i,j)) * mfx(i,j)
-         enddo
-      enddo
-      do j=js,je+1
-         do i=is,ie
-            fy(i,j) = 0.5*(fy(i,j) + fy2(i,j)) * mfy(i,j)
-         enddo
-      enddo
-      if ( present(nord) .and. present(damp_c) .and. present(mass) ) then
-        if ( damp_c > 1.e-4 ) then
-           damp = (damp_c * gridstruct%da_min)**(nord+1)
-           call deln_flux(nord, is,ie,js,je, npx, npy, damp, q, fx, fy, gridstruct, bd, mass )
+     if ( present(mfx) .and. present(mfy) ) then
+  !---------------------------------
+  ! For transport of pt and tracers
+  !---------------------------------
+        do j=js,je
+           do i=is,ie+1
+              fx(i,j) = 0.5*(fx(i,j) + fx2(i,j)) * mfx(i,j)
+           enddo
+        enddo
+        do j=js,je+1
+           do i=is,ie
+              fy(i,j) = 0.5*(fy(i,j) + fy2(i,j)) * mfy(i,j)
+           enddo
+        enddo
+        if ( present(nord) .and. present(damp_c) .and. present(mass) ) then
+          if ( damp_c > 1.e-4 ) then
+             damp = (damp_c * gridstruct%da_min)**(nord+1)
+             call deln_flux(nord, is,ie,js,je, npx, npy, damp, q, fx, fy, gridstruct, bd, mass )
+          endif
         endif
-      endif
-   else
-!---------------------------------
-! For transport of delp, vorticity
-!---------------------------------
-      do j=js,je
-         do i=is,ie+1
-            fx(i,j) = 0.5*(fx(i,j) + fx2(i,j)) * xfx(i,j)
-         enddo
-      enddo
-      do j=js,je+1
-         do i=is,ie
-            fy(i,j) = 0.5*(fy(i,j) + fy2(i,j)) * yfx(i,j)
-         enddo
-      enddo
-      if ( present(nord) .and. present(damp_c) ) then
-           if ( damp_c > 1.E-4 ) then
-                damp = (damp_c * gridstruct%da_min)**(nord+1)
-                call deln_flux(nord, is,ie,js,je, npx, npy, damp, q, fx, fy, gridstruct, bd)
-           endif
-      endif
-   endif
- end subroutine fv_tp_2d
+     else
+  !---------------------------------
+  ! For transport of delp, vorticity
+  !---------------------------------
+        do j=js,je
+           do i=is,ie+1
+              fx(i,j) = 0.5*(fx(i,j) + fx2(i,j)) * xfx(i,j)
+           enddo
+        enddo
+        do j=js,je+1
+           do i=is,ie
+              fy(i,j) = 0.5*(fy(i,j) + fy2(i,j)) * yfx(i,j)
+           enddo
+        enddo
+        if ( present(nord) .and. present(damp_c) ) then
+             if ( damp_c > 1.E-4 ) then
+                  damp = (damp_c * gridstruct%da_min)**(nord+1)
+                  call deln_flux(nord, is,ie,js,je, npx, npy, damp, q, fx, fy, gridstruct, bd)
+             endif
+        endif
+     endif
+  endif
+end subroutine fv_tp_2d
 
  !Weird arguments are because this routine is called in a lot of
  !places outside of tp_core, sometimes very deeply nested in the call tree.
